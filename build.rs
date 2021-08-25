@@ -1,8 +1,6 @@
 pub fn generate() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = "src/generated";
-    let files = [
-        "proto/googleapis/google/monitoring/v3/metric_service.proto",
-    ];
+    let files = ["proto/googleapis/google/monitoring/v3/metric_service.proto"];
 
     std::fs::create_dir_all(out_dir)?;
 

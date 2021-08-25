@@ -2,7 +2,6 @@ use crate::generated::{
     google_api,
     google_monitoring_v3::{
         self, metric_service_client::MetricServiceClient, typed_value, CreateTimeSeriesRequest,
-        TypedValue,
     },
 };
 use thiserror::Error;
@@ -102,7 +101,9 @@ impl TimeSeries {
                 }),
 
                 value: Some(google_monitoring_v3::TypedValue {
-                    value: Some(typed_value::Value::Int64Value(self.points.value.int64_value)),
+                    value: Some(typed_value::Value::Int64Value(
+                        self.points.value.int64_value,
+                    )),
                 }),
             }],
 
@@ -115,6 +116,8 @@ impl TimeSeries {
 pub enum Error {
     #[error("Unmapped gRPC error: {0}")]
     Grpc(tonic::Status),
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -187,7 +190,28 @@ impl Client {
         Ok(Self { client })
     }
 
-    pub async fn create_time_series<'a>(&'a self, series: Vec<TimeSeries>) -> crate::Result<()> {
+    pub async fn create_time_series<'a>(&'a mut self, project_id: &str, series: Vec<TimeSeries>) -> crate::Result<()> {
+        if series.len() > 200 {
+            return Err(Error::InvalidArgument(format!(
+                "Time series list is greater than 200, got {}",
+                series.len()
+            )));
+        }
+
+        let time_series = series
+            .into_iter()
+            .map(|s| s.as_wire_record())
+            .collect::<Vec<google_monitoring_v3::TimeSeries>>();
+
+        let req = CreateTimeSeriesRequest {
+            name: format!("projects/{}", project_id),
+            time_series,
+        };
+
+        if let Err(status) = self.client.create_time_series(tonic::Request::new(req)).await {
+            return Err(Error::Grpc(status));
+        }
+
         Ok(())
     }
 }

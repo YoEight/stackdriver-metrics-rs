@@ -1,5 +1,5 @@
-pub(crate) mod generated;
 mod client;
+pub(crate) mod generated;
 
 pub use client::*;
 

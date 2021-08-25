@@ -125,6 +125,20 @@ pub struct Options {
     credentials_path: Option<String>,
 }
 
+impl Options {
+    pub fn credentials(self, path: impl AsRef<str>) -> Self {
+        Self {
+            credentials_path: Some(path.as_ref().to_string()),
+        }
+    }
+
+    pub fn credentials_options(self, credentials_path: Option<String>) -> Self {
+        Self {
+            credentials_path,
+        }
+    }
+}
+
 struct Auth {
     token: gouth::Token,
 }

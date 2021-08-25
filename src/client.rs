@@ -1,4 +1,6 @@
 use thiserror::Error;
+use tonic::{ transport::{Channel, ClientTlsConfig}, service::interceptor::InterceptedService };
+use crate::generated::google_monitoring_v3::metric_service_client::MetricServiceClient;
 
 #[derive(Debug, Clone)]
 pub struct TypedResource {
@@ -64,19 +66,40 @@ struct Auth {
 }
 
 impl tonic::service::Interceptor for Auth {
-    fn call(&mut self, req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-        Ok(req)
+    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        match self.token.header_value() {
+            Err(e) => Err(tonic::Status::invalid_argument(format!(
+                "Invalid token: {}",
+                e
+            ))),
+            Ok(value) => match value.parse::<tonic::metadata::AsciiMetadataValue>() {
+                Err(e) => Err(tonic::Status::invalid_argument(format!(
+                    "Invalid header value: {}",
+                    e
+                ))),
+                Ok(value) => {
+                    req.metadata_mut().insert("authorization", value);
+
+                    Ok(req)
+                }
+            },
+        }
     }
 }
 
-pub struct Client {}
+pub struct Client {
+    client: MetricServiceClient<InterceptedService<Channel, Auth>>,
+}
 
 impl Client {
-    pub fn with_default() -> gouth::Result<Self> {
-        Client::new(Options::default())
+    pub async fn create_with_default(
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        Client::create(Options::default()).await
     }
 
-    pub fn new(options: Options) -> gouth::Result<Self> {
+    pub async fn create(
+        options: Options,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
         let mut token = gouth::Builder::new().scopes(&[
             "https://www.googleapis.com/auth/cloud-platform,",
             "https://www.googleapis.com/auth/monitoring,",
@@ -88,12 +111,25 @@ impl Client {
             token = token.file(path);
         }
 
-        let token = token.build()?;
+        let auth = Auth {
+            token: token.build()?,
+        };
 
-        Ok(Self {})
+        let uri = "https://monitoring.googleapis.com".parse().unwrap();
+        let channel = Channel::builder(uri)
+            .tls_config(ClientTlsConfig::new())?
+            .connect()
+            .await?;
+
+        let client = MetricServiceClient::with_interceptor(channel, auth);
+
+        Ok(Self {
+            client,
+        })
     }
 
     pub async fn create_time_series<'a>(&'a self, series: Series<'a>) -> crate::Result<()> {
+
         Ok(())
     }
 }

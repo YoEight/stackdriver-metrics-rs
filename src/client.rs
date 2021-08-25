@@ -1,6 +1,15 @@
+use crate::generated::{
+    google_api,
+    google_monitoring_v3::{
+        self, metric_service_client::MetricServiceClient, typed_value, CreateTimeSeriesRequest,
+        TypedValue,
+    },
+};
 use thiserror::Error;
-use tonic::{ transport::{Channel, ClientTlsConfig}, service::interceptor::InterceptedService };
-use crate::generated::google_monitoring_v3::metric_service_client::MetricServiceClient;
+use tonic::{
+    service::interceptor::InterceptedService,
+    transport::{Channel, ClientTlsConfig},
+};
 
 #[derive(Debug, Clone)]
 pub struct TypedResource {
@@ -33,21 +42,73 @@ pub struct Interval {
 
 #[derive(Debug, Clone, Copy)]
 pub struct PointValue {
-    pub int64_value: Option<i64>,
+    pub int64_value: i64,
 }
 
 #[derive(Debug, Clone)]
-pub struct Serie<'a> {
+pub struct TimeSeries {
     pub metric: TypedResource,
     pub resource: TypedResource,
     pub metric_kind: MetricKind,
     pub value_type: ValueType,
-    pub points: &'a [Point],
+    pub points: Point,
 }
 
-#[derive(Debug, Clone)]
-pub struct Series<'a> {
-    time_series: &'a [Serie<'a>],
+fn to_timestamp(datetime: &chrono::DateTime<chrono::Utc>) -> prost_types::Timestamp {
+    prost_types::Timestamp {
+        seconds: datetime.timestamp(),
+        nanos: datetime.timestamp_nanos() as i32,
+    }
+}
+
+impl TimeSeries {
+    fn as_wire_record(self) -> google_monitoring_v3::TimeSeries {
+        let start_time = if let Some(start_time) = self.points.interval.start_time.as_ref() {
+            Some(to_timestamp(start_time))
+        } else {
+            None
+        };
+
+        let end_time = Some(to_timestamp(&self.points.interval.end_time));
+        let metric_kind = match self.metric_kind {
+            MetricKind::Cumulative => 3,
+            MetricKind::Gauge => 1,
+        };
+
+        let value_type = match self.value_type {
+            ValueType::Int64 => 2,
+        };
+
+        google_monitoring_v3::TimeSeries {
+            metric: Some(google_api::Metric {
+                r#type: self.metric.r#type,
+                labels: self.metric.labels,
+            }),
+
+            resource: Some(google_api::MonitoredResource {
+                r#type: self.resource.r#type,
+                labels: self.resource.labels,
+            }),
+
+            metadata: None,
+
+            metric_kind,
+            value_type,
+
+            points: vec![google_monitoring_v3::Point {
+                interval: Some(google_monitoring_v3::TimeInterval {
+                    end_time,
+                    start_time,
+                }),
+
+                value: Some(google_monitoring_v3::TypedValue {
+                    value: Some(typed_value::Value::Int64Value(self.points.value.int64_value)),
+                }),
+            }],
+
+            unit: "INT64".to_string(),
+        }
+    }
 }
 
 #[derive(Error, Debug)]
@@ -123,13 +184,10 @@ impl Client {
 
         let client = MetricServiceClient::with_interceptor(channel, auth);
 
-        Ok(Self {
-            client,
-        })
+        Ok(Self { client })
     }
 
-    pub async fn create_time_series<'a>(&'a self, series: Series<'a>) -> crate::Result<()> {
-
+    pub async fn create_time_series<'a>(&'a self, series: Vec<TimeSeries>) -> crate::Result<()> {
         Ok(())
     }
 }

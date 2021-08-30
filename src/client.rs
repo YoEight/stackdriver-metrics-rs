@@ -5,10 +5,7 @@ use crate::generated::{
     },
 };
 use thiserror::Error;
-use tonic::{
-    service::interceptor::InterceptedService,
-    transport::{Channel, ClientTlsConfig},
-};
+use tonic::transport::{Channel, ClientTlsConfig};
 
 #[derive(Debug, Clone)]
 pub struct TypedResource {
@@ -133,9 +130,7 @@ impl Options {
     }
 
     pub fn credentials_options(self, credentials_path: Option<String>) -> Self {
-        Self {
-            credentials_path,
-        }
+        Self { credentials_path }
     }
 }
 
@@ -143,30 +138,30 @@ struct Auth {
     token: gouth::Token,
 }
 
-impl tonic::service::Interceptor for Auth {
-    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-        match self.token.header_value() {
-            Err(e) => Err(tonic::Status::invalid_argument(format!(
-                "Invalid token: {}",
-                e
-            ))),
-            Ok(value) => match value.parse::<tonic::metadata::AsciiMetadataValue>() {
-                Err(e) => Err(tonic::Status::invalid_argument(format!(
-                    "Invalid header value: {}",
-                    e
-                ))),
-                Ok(value) => {
-                    req.metadata_mut().insert("authorization", value);
+// impl tonic::service::Interceptor for Auth {
+//     fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+//         match self.token.header_value() {
+//             Err(e) => Err(tonic::Status::invalid_argument(format!(
+//                 "Invalid token: {}",
+//                 e
+//             ))),
+//             Ok(value) => match value.parse::<tonic::metadata::AsciiMetadataValue>() {
+//                 Err(e) => Err(tonic::Status::invalid_argument(format!(
+//                     "Invalid header value: {}",
+//                     e
+//                 ))),
+//                 Ok(value) => {
+//                     req.metadata_mut().insert("authorization", value);
 
-                    Ok(req)
-                }
-            },
-        }
-    }
-}
+//                     Ok(req)
+//                 }
+//             },
+//         }
+//     }
+// }
 
 pub struct Client {
-    client: MetricServiceClient<InterceptedService<Channel, Auth>>,
+    channel: Channel,
 }
 
 impl Client {
@@ -181,7 +176,7 @@ impl Client {
         let mut token = gouth::Builder::new().scopes(&[
             "https://www.googleapis.com/auth/cloud-platform,",
             "https://www.googleapis.com/auth/monitoring,",
-            "https://www.googleapis.com/auth/monitoring.read,",
+            // "https://www.googleapis.com/auth/monitoring.read,",
             "https://www.googleapis.com/auth/monitoring.write",
         ]);
 
@@ -199,12 +194,14 @@ impl Client {
             .connect()
             .await?;
 
-        let client = MetricServiceClient::with_interceptor(channel, auth);
-
-        Ok(Self { client })
+        Ok(Self { channel })
     }
 
-    pub async fn create_time_series<'a>(&'a mut self, project_id: &str, series: Vec<TimeSeries>) -> crate::Result<()> {
+    pub async fn create_time_series(
+        &self,
+        project_id: &str,
+        series: Vec<TimeSeries>,
+    ) -> crate::Result<()> {
         if series.len() > 200 {
             return Err(Error::InvalidArgument(format!(
                 "Time series list is greater than 200, got {}",
@@ -222,7 +219,12 @@ impl Client {
             time_series,
         };
 
-        if let Err(status) = self.client.create_time_series(tonic::Request::new(req)).await {
+        let mut client = MetricServiceClient::with_interceptor(
+            self.channel.clone(),
+            gouth::tonic::interceptor(),
+        );
+
+        if let Err(status) = client.create_time_series(tonic::Request::new(req)).await {
             return Err(Error::Grpc(status));
         }
 

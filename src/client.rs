@@ -134,33 +134,8 @@ impl Options {
     }
 }
 
-struct Auth {
-    token: gouth::Token,
-}
-
-// impl tonic::service::Interceptor for Auth {
-//     fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-//         match self.token.header_value() {
-//             Err(e) => Err(tonic::Status::invalid_argument(format!(
-//                 "Invalid token: {}",
-//                 e
-//             ))),
-//             Ok(value) => match value.parse::<tonic::metadata::AsciiMetadataValue>() {
-//                 Err(e) => Err(tonic::Status::invalid_argument(format!(
-//                     "Invalid header value: {}",
-//                     e
-//                 ))),
-//                 Ok(value) => {
-//                     req.metadata_mut().insert("authorization", value);
-
-//                     Ok(req)
-//                 }
-//             },
-//         }
-//     }
-// }
-
 pub struct Client {
+    options: Options,
     channel: Channel,
 }
 
@@ -173,28 +148,13 @@ impl Client {
     pub async fn create(
         options: Options,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
-        let mut token = gouth::Builder::new().scopes(&[
-            "https://www.googleapis.com/auth/cloud-platform,",
-            "https://www.googleapis.com/auth/monitoring,",
-            // "https://www.googleapis.com/auth/monitoring.read,",
-            "https://www.googleapis.com/auth/monitoring.write",
-        ]);
-
-        if let Some(path) = options.credentials_path.as_ref() {
-            token = token.file(path);
-        }
-
-        let auth = Auth {
-            token: token.build()?,
-        };
-
         let uri = "https://monitoring.googleapis.com".parse().unwrap();
         let channel = Channel::builder(uri)
             .tls_config(ClientTlsConfig::new())?
             .connect()
             .await?;
 
-        Ok(Self { channel })
+        Ok(Self { options, channel })
     }
 
     pub async fn create_time_series(
@@ -221,7 +181,7 @@ impl Client {
 
         let mut client = MetricServiceClient::with_interceptor(
             self.channel.clone(),
-            tonic_ext::interceptor(),
+            tonic_ext::interceptor(&self.options),
         );
 
         if let Err(status) = client.create_time_series(tonic::Request::new(req)).await {
@@ -233,7 +193,6 @@ impl Client {
 }
 
 mod tonic_ext {
-    use gouth::Token;
     use tonic::{metadata::MetadataValue, Interceptor, Request, Status};
 
     macro_rules! map_err {
@@ -242,8 +201,19 @@ mod tonic_ext {
         };
     }
 
-    pub fn interceptor() -> impl Into<Interceptor> {
-        let token = Token::new().expect("Token::new()");
+    pub fn interceptor(options: &crate::Options) -> impl Into<Interceptor> {
+        let mut token = gouth::Builder::new().scopes(&[
+            "https://www.googleapis.com/auth/cloud-platform",
+            "https://www.googleapis.com/auth/monitoring",
+            "https://www.googleapis.com/auth/monitoring.write",
+        ]);
+
+        if let Some(path) = options.credentials_path.as_ref() {
+            token = token.file(path);
+        }
+
+        let token = token.build().expect("Token::build()");
+
         move |mut req: Request<()>| {
             let token = map_err!(token.header_value())?;
             let meta = map_err!(MetadataValue::from_str(&*token))?;

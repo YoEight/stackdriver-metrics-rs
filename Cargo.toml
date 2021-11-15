@@ -12,7 +12,7 @@ prost-types = "0.7"
 prost-derive = "0.7"
 chrono = "0.4"
 thiserror = "1"
-gouth = "=0.2.0"
+gouth = "=0.2.1"
 # gouth = { version = "0.2", features = ["tonic-intercept"] }
 
 [dev-dependencies]

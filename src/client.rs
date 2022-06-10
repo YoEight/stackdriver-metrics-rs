@@ -1,11 +1,20 @@
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
+
 use crate::generated::{
     google_api,
     google_monitoring_v3::{
         self, metric_service_client::MetricServiceClient, typed_value, CreateTimeSeriesRequest,
     },
 };
+use futures::{stream::StreamExt, Stream};
 use thiserror::Error;
-use tonic::transport::{Channel, ClientTlsConfig};
+use tonic::{
+    transport::{Channel, ClientTlsConfig},
+    Code,
+};
 
 #[derive(Debug, Clone)]
 pub struct TypedResource {
@@ -117,49 +126,72 @@ pub enum Error {
     InvalidArgument(String),
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Options {
     credentials_path: Option<String>,
+    batch_size: usize,
+    period: Duration,
+    retries: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            credentials_path: None,
+            batch_size: 200,
+            period: Duration::from_secs(10),
+            retries: 3,
+        }
+    }
 }
 
 impl Options {
     pub fn credentials(self, path: impl AsRef<str>) -> Self {
         Self {
             credentials_path: Some(path.as_ref().to_string()),
+            ..self
         }
     }
 
     pub fn credentials_options(self, credentials_path: Option<String>) -> Self {
-        Self { credentials_path }
+        Self {
+            credentials_path,
+            ..self
+        }
+    }
+
+    pub fn batch_size(self, batch_size: usize) -> Self {
+        Self { batch_size, ..self }
+    }
+
+    pub fn period(self, period: Duration) -> Self {
+        Self { period, ..self }
+    }
+
+    pub fn retries(self, retries: usize) -> Self {
+        Self { retries, ..self }
     }
 }
 
 pub struct Client {
-    options: Options,
     channel: Channel,
 }
 
 impl Client {
-    pub async fn create_with_default(
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
-        Client::create(Options::default()).await
-    }
-
-    pub async fn create(
-        options: Options,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    pub async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
         let uri = "https://monitoring.googleapis.com".parse().unwrap();
         let channel = Channel::builder(uri)
             .tls_config(ClientTlsConfig::new())?
             .connect()
             .await?;
 
-        Ok(Self { options, channel })
+        Ok(Self { channel })
     }
 
     pub async fn create_time_series(
         &self,
         project_id: &str,
+        options: &Options,
         series: Vec<TimeSeries>,
     ) -> crate::Result<()> {
         if series.len() > 200 {
@@ -181,7 +213,7 @@ impl Client {
 
         let mut client = MetricServiceClient::with_interceptor(
             self.channel.clone(),
-            tonic_ext::interceptor(&self.options),
+            tonic_ext::interceptor(&options),
         );
 
         if let Err(status) = client.create_time_series(tonic::Request::new(req)).await {
@@ -189,6 +221,76 @@ impl Client {
         }
 
         Ok(())
+    }
+
+    pub async fn stream_time_series<S>(&self, project_id: &str, options: &Options, mut stream: S)
+    where
+        S: Stream<Item = TimeSeries> + Unpin,
+    {
+        let mut buffer = HashMap::<String, TimeSeries>::with_capacity(options.batch_size);
+        let mut last_time = Instant::now();
+        let mut total_metrics = 0usize;
+        let mut successes = 0usize;
+        let mut failures = 0usize;
+        let started = Instant::now();
+
+        while let Some(series) = stream.next().await {
+            total_metrics += 1;
+            buffer.insert(series.metric.r#type.clone(), series);
+
+            if buffer.len() < options.batch_size && last_time.elapsed() < options.period {
+                continue;
+            }
+
+            loop {
+                if last_time.elapsed() >= options.period {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+
+            let series = buffer.drain().map(|t| t.1).collect::<Vec<_>>();
+
+            let mut attempts = 1usize;
+            loop {
+                if let Err(e) = self
+                    .create_time_series(project_id, options, series.clone())
+                    .await
+                {
+                    if let Error::Grpc(status) = &e {
+                        if status.code() == Code::ResourceExhausted && attempts < options.retries {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            attempts += 1;
+                            continue;
+                        }
+                    }
+
+                    failures += 1;
+                    error!("Error when sending time_series: {}", e);
+                } else {
+                    successes += 1;
+                    last_time = Instant::now();
+                }
+
+                break;
+            }
+
+            let total = successes + failures;
+
+            let success_rate = if total == 0 {
+                100f64
+            } else {
+                (successes as f64 / total as f64) * 100f64
+            };
+
+            let metrics_processing = total_metrics as f64 / started.elapsed().as_secs_f64();
+
+            debug!(
+                "Success rate: {:.2}%, Metric processing speed: {:.2}metrics/s",
+                success_rate, metrics_processing
+            );
+        }
     }
 }
 

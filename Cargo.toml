@@ -6,14 +6,23 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tonic = { version = "0.4", default-features = false, features = [ "prost", "tls", "transport", "codegen", "tls-roots" ] }
+tonic = { version = "0.4", default-features = false, features = [
+  "prost",
+  "tls",
+  "transport",
+  "codegen",
+  "tls-roots",
+] }
 prost = "0.7"
 prost-types = "0.7"
 prost-derive = "0.7"
 chrono = "0.4"
 thiserror = "1"
 gouth = "=0.2.1"
+futures = "*"
 # gouth = { version = "0.2", features = ["tonic-intercept"] }
+tokio = { version = "1", features = ["time"] }
+tracing = "*"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

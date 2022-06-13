@@ -20,7 +20,6 @@ chrono = "0.4"
 thiserror = "1"
 gouth = "=0.2.1"
 futures = "*"
-# gouth = { version = "0.2", features = ["tonic-intercept"] }
 tokio = { version = "1", features = ["time"] }
 tracing = "*"
 

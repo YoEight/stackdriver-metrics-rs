@@ -259,7 +259,9 @@ impl Client {
                     .await
                 {
                     if let Error::Grpc(status) = &e {
-                        if status.code() == Code::ResourceExhausted && attempts < options.retries {
+                        if (status.code() == Code::Internal || status.code() == Code::Unknown)
+                            && attempts < options.retries
+                        {
                             tokio::time::sleep(Duration::from_millis(500)).await;
                             attempts += 1;
                             continue;

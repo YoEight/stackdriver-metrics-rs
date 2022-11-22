@@ -31,12 +31,23 @@ pub enum MetricKind {
 #[derive(Debug, Clone, Copy)]
 pub enum ValueType {
     Int64,
+    Double,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Point {
     pub interval: Interval,
     pub value: PointValue,
+}
+
+impl Point {
+    fn incr_by(&mut self, point_value: PointValue) {
+        self.value.value += point_value.value;
+    }
+
+    fn replace(&mut self, point_value: PointValue) {
+        self.value = point_value;
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -47,7 +58,21 @@ pub struct Interval {
 
 #[derive(Debug, Clone, Copy)]
 pub struct PointValue {
-    pub int64_value: i64,
+    value: f64,
+}
+
+impl PointValue {
+    pub fn new(value: f64) -> Self {
+        Self { value }
+    }
+
+    pub fn as_i64(self) -> i64 {
+        self.value as i64
+    }
+
+    pub fn as_f64(self) -> f64 {
+        self.value
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -75,13 +100,25 @@ impl TimeSeries {
         };
 
         let end_time = Some(to_timestamp(&self.points.interval.end_time));
-        let metric_kind = match self.metric_kind {
-            MetricKind::Cumulative => 3,
-            MetricKind::Gauge => 1,
+        let (metric_kind, unit) = match self.metric_kind {
+            MetricKind::Cumulative => (
+                crate::generated::google_api::metric_descriptor::MetricKind::Cumulative,
+                "INT64".to_string(),
+            ),
+            MetricKind::Gauge => (
+                crate::generated::google_api::metric_descriptor::MetricKind::Gauge,
+                "DOUBLE".to_string(),
+            ),
         };
 
         let value_type = match self.value_type {
-            ValueType::Int64 => 2,
+            ValueType::Int64 => crate::generated::google_api::metric_descriptor::ValueType::Int64,
+            ValueType::Double => crate::generated::google_api::metric_descriptor::ValueType::Double,
+        };
+
+        let value = match self.value_type {
+            ValueType::Int64 => typed_value::Value::Int64Value(self.points.value.as_i64()),
+            ValueType::Double => typed_value::Value::DoubleValue(self.points.value.as_f64()),
         };
 
         google_monitoring_v3::TimeSeries {
@@ -97,8 +134,8 @@ impl TimeSeries {
 
             metadata: None,
 
-            metric_kind,
-            value_type,
+            metric_kind: metric_kind.into(),
+            value_type: value_type.into(),
 
             points: vec![google_monitoring_v3::Point {
                 interval: Some(google_monitoring_v3::TimeInterval {
@@ -106,14 +143,10 @@ impl TimeSeries {
                     start_time,
                 }),
 
-                value: Some(google_monitoring_v3::TypedValue {
-                    value: Some(typed_value::Value::Int64Value(
-                        self.points.value.int64_value,
-                    )),
-                }),
+                value: Some(google_monitoring_v3::TypedValue { value: Some(value) }),
             }],
 
-            unit: "INT64".to_string(),
+            unit,
         }
     }
 }
@@ -236,7 +269,17 @@ impl Client {
 
         while let Some(series) = stream.next().await {
             total_metrics += 1;
-            buffer.insert(series.metric.r#type.clone(), series);
+            buffer
+                .entry(series.metric.r#type.clone())
+                .and_modify(|cur| match cur.metric_kind {
+                    MetricKind::Cumulative => {
+                        cur.points.incr_by(series.points.value);
+                    }
+                    MetricKind::Gauge => {
+                        cur.points.replace(series.points.value);
+                    }
+                })
+                .or_insert(series);
 
             if buffer.len() < options.batch_size && last_time.elapsed() < options.period {
                 continue;

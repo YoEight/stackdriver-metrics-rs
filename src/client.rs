@@ -100,20 +100,22 @@ impl TimeSeries {
         };
 
         let end_time = Some(to_timestamp(&self.points.interval.end_time));
-        let (metric_kind, unit) = match self.metric_kind {
-            MetricKind::Cumulative => (
-                crate::generated::google_api::metric_descriptor::MetricKind::Cumulative,
-                "INT64".to_string(),
-            ),
-            MetricKind::Gauge => (
-                crate::generated::google_api::metric_descriptor::MetricKind::Gauge,
-                "DOUBLE".to_string(),
-            ),
+        let metric_kind = match self.metric_kind {
+            MetricKind::Cumulative => {
+                crate::generated::google_api::metric_descriptor::MetricKind::Cumulative
+            }
+            MetricKind::Gauge => crate::generated::google_api::metric_descriptor::MetricKind::Gauge,
         };
 
-        let value_type = match self.value_type {
-            ValueType::Int64 => crate::generated::google_api::metric_descriptor::ValueType::Int64,
-            ValueType::Double => crate::generated::google_api::metric_descriptor::ValueType::Double,
+        let (value_type, unit) = match self.value_type {
+            ValueType::Int64 => (
+                crate::generated::google_api::metric_descriptor::ValueType::Int64,
+                "INT64".to_string(),
+            ),
+            ValueType::Double => (
+                crate::generated::google_api::metric_descriptor::ValueType::Double,
+                "DOUBLE".to_string(),
+            ),
         };
 
         let value = match self.value_type {

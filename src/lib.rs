@@ -1,5 +1,6 @@
 #[macro_use]
 extern crate tracing;
+pub(crate) mod cached;
 mod client;
 pub(crate) mod generated;
 

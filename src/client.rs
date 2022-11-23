@@ -3,6 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::cached::CachedDate;
 use crate::generated::{
     google_api,
     google_monitoring_v3::{
@@ -22,7 +23,7 @@ pub struct TypedResource {
     pub labels: std::collections::HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricKind {
     Cumulative,
     Gauge,
@@ -31,23 +32,13 @@ pub enum MetricKind {
 #[derive(Debug, Clone, Copy)]
 pub enum ValueType {
     Int64,
+    Double,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Point {
-    pub interval: Interval,
-    pub value: PointValue,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct Interval {
-    pub start_time: Option<chrono::DateTime<chrono::Utc>>,
-    pub end_time: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct PointValue {
-    pub int64_value: i64,
+    pub value: f64,
+    pub created: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,29 +50,50 @@ pub struct TimeSeries {
     pub points: Point,
 }
 
-fn to_timestamp(datetime: &chrono::DateTime<chrono::Utc>) -> prost_types::Timestamp {
+fn to_timestamp(datetime: chrono::DateTime<chrono::Utc>) -> prost_types::Timestamp {
     prost_types::Timestamp {
         seconds: datetime.timestamp(),
         nanos: datetime.timestamp_nanos() as i32,
     }
 }
 
+/// According to GCP, a metric start time can't be more than 25 hours in the past.
+const DURATION_25_HOURS: Duration = Duration::from_secs(25 * 3_600);
+
 impl TimeSeries {
-    fn as_wire_record(self) -> google_monitoring_v3::TimeSeries {
-        let start_time = if let Some(start_time) = self.points.interval.start_time.as_ref() {
-            Some(to_timestamp(start_time))
+    fn as_wire_record(self, cached_date: &mut CachedDate) -> google_monitoring_v3::TimeSeries {
+        if cached_date.elapsed() >= DURATION_25_HOURS {
+            cached_date.reset();
+        }
+
+        let end_time = to_timestamp(self.points.created);
+        let start_time = if self.metric_kind == MetricKind::Gauge {
+            end_time.clone()
         } else {
-            None
+            to_timestamp(cached_date.time())
         };
 
-        let end_time = Some(to_timestamp(&self.points.interval.end_time));
         let metric_kind = match self.metric_kind {
-            MetricKind::Cumulative => 3,
-            MetricKind::Gauge => 1,
+            MetricKind::Cumulative => {
+                crate::generated::google_api::metric_descriptor::MetricKind::Cumulative
+            }
+            MetricKind::Gauge => crate::generated::google_api::metric_descriptor::MetricKind::Gauge,
         };
 
-        let value_type = match self.value_type {
-            ValueType::Int64 => 2,
+        let (value_type, unit) = match self.value_type {
+            ValueType::Int64 => (
+                crate::generated::google_api::metric_descriptor::ValueType::Int64,
+                "INT64".to_string(),
+            ),
+            ValueType::Double => (
+                crate::generated::google_api::metric_descriptor::ValueType::Double,
+                "DOUBLE".to_string(),
+            ),
+        };
+
+        let value = match self.value_type {
+            ValueType::Int64 => typed_value::Value::Int64Value(self.points.value as i64),
+            ValueType::Double => typed_value::Value::DoubleValue(self.points.value),
         };
 
         google_monitoring_v3::TimeSeries {
@@ -97,23 +109,19 @@ impl TimeSeries {
 
             metadata: None,
 
-            metric_kind,
-            value_type,
+            metric_kind: metric_kind.into(),
+            value_type: value_type.into(),
 
             points: vec![google_monitoring_v3::Point {
                 interval: Some(google_monitoring_v3::TimeInterval {
-                    end_time,
-                    start_time,
+                    end_time: Some(end_time),
+                    start_time: Some(start_time),
                 }),
 
-                value: Some(google_monitoring_v3::TypedValue {
-                    value: Some(typed_value::Value::Int64Value(
-                        self.points.value.int64_value,
-                    )),
-                }),
+                value: Some(google_monitoring_v3::TypedValue { value: Some(value) }),
             }],
 
-            unit: "INT64".to_string(),
+            unit,
         }
     }
 }
@@ -188,23 +196,18 @@ impl Client {
         Ok(Self { channel })
     }
 
-    pub async fn create_time_series(
+    async fn create_time_series(
         &self,
         project_id: &str,
         options: &Options,
-        series: Vec<TimeSeries>,
+        time_series: Vec<google_monitoring_v3::TimeSeries>,
     ) -> crate::Result<()> {
-        if series.len() > 200 {
+        if time_series.len() > 200 {
             return Err(Error::InvalidArgument(format!(
                 "Time series list is greater than 200, got {}",
-                series.len()
+                time_series.len()
             )));
         }
-
-        let time_series = series
-            .into_iter()
-            .map(|s| s.as_wire_record())
-            .collect::<Vec<google_monitoring_v3::TimeSeries>>();
 
         let req = CreateTimeSeriesRequest {
             name: format!("projects/{}", project_id),
@@ -232,11 +235,22 @@ impl Client {
         let mut total_metrics = 0usize;
         let mut successes = 0usize;
         let mut failures = 0usize;
+        let mut cached_date = CachedDate::new();
         let started = Instant::now();
 
         while let Some(series) = stream.next().await {
             total_metrics += 1;
-            buffer.insert(series.metric.r#type.clone(), series);
+            buffer
+                .entry(series.metric.r#type.clone())
+                .and_modify(|cur| match cur.metric_kind {
+                    MetricKind::Cumulative => {
+                        cur.points.value += series.points.value;
+                    }
+                    MetricKind::Gauge => {
+                        cur.points.value = series.points.value;
+                    }
+                })
+                .or_insert(series);
 
             if buffer.len() < options.batch_size && last_time.elapsed() < options.period {
                 continue;
@@ -250,7 +264,10 @@ impl Client {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
 
-            let series = buffer.drain().map(|t| t.1).collect::<Vec<_>>();
+            let series = buffer
+                .drain()
+                .map(|t| t.1.as_wire_record(&mut cached_date))
+                .collect::<Vec<_>>();
 
             let mut attempts = 1usize;
             loop {

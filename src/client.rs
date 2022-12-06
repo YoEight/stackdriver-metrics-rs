@@ -8,6 +8,7 @@ use crate::generated::{
     google_api,
     google_monitoring_v3::{
         self, metric_service_client::MetricServiceClient, typed_value, CreateTimeSeriesRequest,
+        DeleteMetricDescriptorRequest,
     },
 };
 use futures::{stream::StreamExt, Stream};
@@ -59,6 +60,49 @@ fn to_timestamp(datetime: chrono::DateTime<chrono::Utc>) -> prost_types::Timesta
 
 /// According to GCP, a metric start time can't be more than 25 hours in the past.
 const DURATION_25_HOURS: Duration = Duration::from_secs(25 * 3_600);
+
+pub struct ListMetricDescriptorsOptions {
+    credential_path: Option<String>,
+    filter: String,
+    page_size: i32,
+}
+
+impl Default for ListMetricDescriptorsOptions {
+    fn default() -> Self {
+        Self {
+            credential_path: None,
+            filter: String::default(),
+            page_size: 500,
+        }
+    }
+}
+
+impl ListMetricDescriptorsOptions {
+    pub fn filter(self, filter: impl AsRef<str>) -> Self {
+        Self {
+            filter: filter.as_ref().to_string(),
+            ..self
+        }
+    }
+
+    pub fn page_size(self, page_size: i32) -> Self {
+        Self { page_size, ..self }
+    }
+
+    pub fn credentials(self, path: impl AsRef<str>) -> Self {
+        Self {
+            credential_path: Some(path.as_ref().to_string()),
+            ..self
+        }
+    }
+
+    pub fn credentials_options(self, credential_path: Option<String>) -> Self {
+        Self {
+            credential_path,
+            ..self
+        }
+    }
+}
 
 impl TimeSeries {
     fn as_wire_record(self, cached_date: &mut CachedDate) -> google_monitoring_v3::TimeSeries {
@@ -132,6 +176,8 @@ pub enum Error {
     Grpc(tonic::Status),
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
+    #[error("Initialization error: {0}")]
+    InitializationError(String),
 }
 
 #[derive(Debug, Clone)]
@@ -181,17 +227,20 @@ impl Options {
     }
 }
 
+#[derive(Clone)]
 pub struct Client {
     channel: Channel,
 }
 
 impl Client {
-    pub async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    pub async fn new() -> crate::Result<Self> {
         let uri = "https://monitoring.googleapis.com".parse().unwrap();
         let channel = Channel::builder(uri)
-            .tls_config(ClientTlsConfig::new())?
+            .tls_config(ClientTlsConfig::new())
+            .map_err(|e| Error::InitializationError(e.to_string()))?
             .connect()
-            .await?;
+            .await
+            .map_err(|e| Error::InitializationError(e.to_string()))?;
 
         Ok(Self { channel })
     }
@@ -309,6 +358,177 @@ impl Client {
                 "Success rate: {:.2}%, Metric processing speed: {:.2}metrics/s",
                 success_rate, metrics_processing
             );
+        }
+    }
+
+    pub fn list_metric_descriptors(
+        &self,
+        project_id: impl AsRef<str>,
+        options: &ListMetricDescriptorsOptions,
+    ) -> ListMetricDescriptors {
+        ListMetricDescriptors::new(self.clone(), project_id.as_ref().to_string(), options)
+    }
+
+    pub async fn delete_metric_descriptor(
+        &self,
+        name: impl AsRef<str>,
+        options: &Options,
+    ) -> crate::Result<()> {
+        let req = DeleteMetricDescriptorRequest {
+            name: name.as_ref().to_string(),
+        };
+
+        let mut client = MetricServiceClient::with_interceptor(
+            self.channel.clone(),
+            tonic_ext::interceptor(&options),
+        );
+
+        if let Err(status) = client.delete_metric_descriptor(tonic::Request::new(req)).await {
+            return Err(Error::Grpc(status));
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LabelDescriptor {
+    pub key: String,
+    pub value_type: i32,
+    pub description: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct MetricDescriptorMetadata {
+    pub sample_period: Option<Duration>,
+    pub ingest_delay: Option<Duration>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MetricDescriptor {
+    pub name: String,
+    pub r#type: String,
+    pub labels: Vec<LabelDescriptor>,
+    pub metric_kind: i32,
+    pub value_type: i32,
+    pub unit: String,
+    pub description: String,
+    pub display_name: String,
+    pub metadata: Option<MetricDescriptorMetadata>,
+    pub launch_stage: i32,
+    pub monitored_resource_types: Vec<String>,
+}
+
+pub struct ListMetricDescriptors {
+    credentials_path: Option<String>,
+    page_size: i32,
+    filter: String,
+    project_id: String,
+    first_time: bool,
+    client: Client,
+    buffer: Vec<crate::generated::google_api::MetricDescriptor>,
+    next_page_token: Option<String>,
+}
+
+impl ListMetricDescriptors {
+    fn new(client: Client, project_id: String, options: &ListMetricDescriptorsOptions) -> Self {
+        Self {
+            credentials_path: options.credential_path.clone(),
+            project_id,
+            first_time: true,
+            page_size: options.page_size,
+            filter: options.filter.to_string(),
+            buffer: Default::default(),
+            next_page_token: None,
+            client,
+        }
+    }
+}
+
+impl ListMetricDescriptors {
+    pub async fn next(&mut self) -> crate::Result<Option<MetricDescriptor>> {
+        loop {
+            if self.first_time {
+                self.first_time = false;
+                self.next_page_token = Some("".to_string());
+            }
+
+            if let Some(metric) = self.buffer.pop() {
+                let metric = MetricDescriptor {
+                    name: metric.name,
+                    r#type: metric.r#type,
+                    labels: metric
+                        .labels
+                        .into_iter()
+                        .map(|l| LabelDescriptor {
+                            key: l.key,
+                            value_type: l.value_type,
+                            description: l.description,
+                        })
+                        .collect::<Vec<_>>(),
+                    metric_kind: metric.metric_kind,
+                    value_type: metric.value_type,
+                    unit: metric.unit,
+                    description: metric.description,
+                    display_name: metric.display_name,
+                    metadata: metric.metadata.map(|m| MetricDescriptorMetadata {
+                        sample_period: m
+                            .sample_period
+                            .map(|d| Duration::new(d.seconds as u64, d.nanos as u32)),
+                        ingest_delay: m
+                            .ingest_delay
+                            .map(|d| Duration::new(d.seconds as u64, d.nanos as u32)),
+                    }),
+                    launch_stage: metric.launch_stage,
+                    monitored_resource_types: metric.monitored_resource_types,
+                };
+
+                return Ok(Some(metric));
+            }
+
+            if let Some(page_token) = self.next_page_token.take() {
+                // We create a shallow options as we don't need much of its properties.
+                // TODO - I'll rewrite that part at some point.
+                let options = Options {
+                    credentials_path: self.credentials_path.clone(),
+                    batch_size: 0,
+                    period: Duration::from_secs(0),
+                    retries: 1,
+                };
+                let mut client = MetricServiceClient::with_interceptor(
+                    self.client.channel.clone(),
+                    tonic_ext::interceptor(&options),
+                );
+
+                let req = crate::generated::google_monitoring_v3::ListMetricDescriptorsRequest {
+                    name: format!("projects/{}", self.project_id),
+                    filter: self.filter.clone(),
+                    page_size: self.page_size,
+                    page_token,
+                };
+
+                match client
+                    .list_metric_descriptors(tonic::Request::new(req))
+                    .await
+                {
+                    Err(status) => return Err(Error::Grpc(status)),
+                    Ok(resp) => {
+                        let resp = resp.into_inner();
+
+                        self.buffer = resp.metric_descriptors;
+
+                        self.next_page_token = if resp.next_page_token.is_empty() {
+                            None
+                        } else {
+                            Some(resp.next_page_token)
+                        };
+                    }
+                }
+
+                continue;
+            }
+
+            return Ok(None);
         }
     }
 }
